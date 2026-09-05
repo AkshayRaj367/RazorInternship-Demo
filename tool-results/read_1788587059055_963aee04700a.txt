@@ -1,0 +1,775 @@
+     1→"""Transaction engine — the SINGLE payment code path for every caller.
+     2→
+     3→Flow (autonomous, amount <= SPEND_LIMIT_PAISE):
+     4→  idempotency pre-check -> MCP create_order (atomic stock lock) -> INVENTORY_LOCK
+     5→  audit -> GUARDRAIL_PASS audit -> [ACID txn: OCC debit + tx insert + Razorpay
+     6→  TEST order + order update] -> ORDER_GENERATED audit -> return 'pending'
+     7→  (webhook payment.captured later completes it).
+     8→
+     9→Flow (OTP-gated, amount > SPEND_LIMIT_PAISE):
+    10→  same until INVENTORY_LOCK, then: transaction doc status 'awaiting_otp' +
+    11→  otp_challenges doc (bcrypt hash) -> GUARDRAIL_OTP_REQUIRED audit + ws
+    12→  'otp:required' -> 202. THE WALLET IS NOT TOUCHED until a human verifies.
+    13→  On verify: OTP_VERIFIED audit -> same ACID block with a server-side
+    14→  OtpAuthorization -> ORDER_GENERATED.
+    15→
+    16→Idempotency / replay-attack prevention (both lines active):
+    17→  1. Pre-check: transactions.idempotencyKey lookup -> stored resultSnapshot is
+    18→     returned VERBATIM (no re-debit, no re-Razorpay call).
+    19→  2. DB level: unique index on idempotencyKey -> E11000 on concurrent same-key
+    20→     inserts is caught and the winner's snapshot is returned.
+    21→
+    22→Concurrency: the debit is wallet_service.execute_debit — atomic OCC
+    23→find_one_and_update with 5 jittered-backoff retries, fresh guardrail check per
+    24→attempt, and multi-document ACID semantics via the passed Mongo session.
+    25→"""
+    26→import functools
+    27→import re
+    28→import uuid
+    29→from datetime import datetime, timedelta, timezone
+    30→from typing import Any
+    31→
+    32→from bson import ObjectId
+    33→from bson.errors import InvalidId
+    34→from flask import jsonify, request
+    35→from pymongo import ReturnDocument
+    36→
+    37→import db
+    38→import mcp_client
+    39→import razorpay_client
+    40→import ws_client
+    41→from config import config
+    42→from services import otp_service, wallet_service
+    43→from services.audit_service import log_step
+    44→from services.wallet_service import OtpAuthorization, WalletError
+    45→
+    46→IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9._:-]{8,200}$")
+    47→SESSION_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{6,128}$")
+    48→
+    49→
+    50→class TransactionError(Exception):
+    51→    def __init__(self, code: str, message: str, http_status: int = 400, data: Any = None) -> None:
+    52→        super().__init__(message)
+    53→        self.code = code
+    54→        self.http_status = http_status
+    55→        self.data = data
+    56→
+    57→
+    58→def _utcnow() -> datetime:
+    59→    return datetime.now(timezone.utc)
+    60→
+    61→
+    62→# ---------------------------------------------------------------------------
+    63→# Reusable idempotency-key enforcement (Flask decorator — the Python twin of
+    64→# mcp-server's middleware/idempotency.ts; write endpoints use it, none hand-roll).
+    65→# ---------------------------------------------------------------------------
+    66→
+    67→def require_idempotency_key(view_fn):
+    68→    @functools.wraps(view_fn)
+    69→    def wrapper(*args, **kwargs):
+    70→        body = request.get_json(silent=True) or {}
+    71→        raw = request.headers.get("Idempotency-Key") or body.get("idempotencyKey")
+    72→        key = raw.strip() if isinstance(raw, str) else None
+    73→        if not key or not IDEMPOTENCY_KEY_RE.match(key):
+    74→            return (
+    75→                jsonify(
+    76→                    {
+    77→                        "error": "MISSING_IDEMPOTENCY_KEY",
+    78→                        "hint": "Send an Idempotency-Key header or idempotencyKey field (8-200 chars, e.g. a UUID).",
+    79→                    }
+    80→                ),
+    81→                400,
+    82→            )
+    83→        return view_fn(*args, **kwargs, idempotency_key=key)
+    84→
+    85→    return wrapper
+    86→
+    87→
+    88→# ---------------------------------------------------------------------------
+    89→# Validation helpers
+    90→# ---------------------------------------------------------------------------
+    91→
+    92→def _validate_items(items: Any) -> list[dict[str, Any]]:
+    93→    if not isinstance(items, list) or not items or len(items) > 20:
+    94→        raise TransactionError("INVALID_ITEMS", "items must be a non-empty list (max 20).")
+    95→    cleaned = []
+    96→    for raw in items:
+    97→        if not isinstance(raw, dict):
+    98→            raise TransactionError("INVALID_ITEMS", "each item must be an object {sku, qty}.")
+    99→        sku = raw.get("sku")
+   100→        qty = raw.get("qty")
+   101→        if not isinstance(sku, str) or not sku.strip():
+   102→            raise TransactionError("INVALID_ITEMS", "each item needs a string sku.")
+   103→        if not isinstance(qty, int) or isinstance(qty, bool) or qty < 1 or qty > 100:
+   104→            raise TransactionError("INVALID_ITEMS", f"qty for {sku} must be an integer 1..100.")
+   105→        cleaned.append({"sku": sku.strip(), "qty": qty})
+   106→    return cleaned
+   107→
+   108→
+   109→def _validate_session_id(session_id: Any) -> str:
+   110→    if not isinstance(session_id, str) or not SESSION_ID_RE.match(session_id):
+   111→        raise TransactionError("INVALID_SESSION_ID", "sessionId must match [A-Za-z0-9._:-]{6,128}.")
+   112→    return session_id
+   113→
+   114→
+   115→def _response_for(doc: dict) -> dict:
+   116→    """Stored resultSnapshot replayed VERBATIM on idempotent hits."""
+   117→    snapshot = doc.get("resultSnapshot")
+   118→    if isinstance(snapshot, dict):
+   119→        return snapshot
+   120→    return {"status": doc.get("status"), "transactionId": str(doc["_id"]), "idempotencyKey": doc.get("idempotencyKey")}
+   121→
+   122→
+   123→# ---------------------------------------------------------------------------
+   124→# Order helpers (orders live in the shared cluster; agent-service transitions
+   125→# payment state on them directly — documented in docs/ARCHITECTURE.md)
+   126→# ---------------------------------------------------------------------------
+   127→
+   128→def _get_order_doc(order_number: str) -> dict | None:
+   129→    return db.orders().find_one({"orderNumber": order_number})
+   130→
+   131→
+   132→_CANCELABLE_STATUSES = ("created", "payment_pending", "payment_failed", "recovery_in_progress")
+   133→
+   134→
+   135→def cancel_order_and_release_stock(order_number: str, reason: str, agent_id: str, session_id: str) -> bool:
+   136→    """Conditionally cancel the order and release reserved stock exactly once."""
+   137→    doc = db.orders().find_one_and_update(
+   138→        {"orderNumber": order_number, "status": {"$in": list(_CANCELABLE_STATUSES)}},
+   139→        {"$set": {"status": "cancelled", "updatedAt": _utcnow()}},
+   140→        return_document=ReturnDocument.AFTER,
+   141→    )
+   142→    if doc is None:
+   143→        return False  # already cancelled / paid / recovered — never double-release
+   144→    for item in doc.get("items", []):
+   145→        db.catalog_items().update_one(
+   146→            {"sku": item["sku"], "reservedStock": {"$gte": item["qty"]}},
+   147→            {"$inc": {"stock": item["qty"], "reservedStock": -item["qty"], "version": 1}},
+   148→        )
+   149→    log_step(
+   150→        session_id,
+   151→        agent_id,
+   152→        "ORDER_CANCELLED",
+   153→        {"orderNumber": order_number, "reason": reason},
+   154→        order_id=doc.get("_id"),
+   155→    )
+   156→    return True
+   157→
+   158→
+   159→# ---------------------------------------------------------------------------
+   160→# Core: execute_transaction — the one entrypoint for money movement
+   161→# ---------------------------------------------------------------------------
+   162→
+   163→def execute_transaction(
+   164→    agent_id: str,
+   165→    session_id: str,
+   166→    items: Any,
+   167→    idempotency_key: str,
+   168→    source: str = "api",
+   169→) -> dict:
+   170→    """Execute a guarded purchase. Returns a JSON-safe response dict.
+   171→
+   172→    `source` ('api' | 'onyx' | 'mcp') is audit metadata ONLY — it never changes
+   173→    which rules apply. The guardrail is enforced identically for every source.
+   174→    """
+   175→    _validate_session_id(session_id)
+   176→    cleaned_items = _validate_items(items)
+   177→    if not isinstance(agent_id, str) or len(agent_id.strip()) < 2:
+   178→        raise TransactionError("INVALID_AGENT_ID", "agentId must be a non-empty string.")
+   179→    if not isinstance(idempotency_key, str) or not IDEMPOTENCY_KEY_RE.match(idempotency_key):
+   180→        raise TransactionError("MISSING_IDEMPOTENCY_KEY", "idempotencyKey (8-200 chars) is required.")
+   181→    agent_id = agent_id.strip()
+   182→
+   183→    # ---- Idempotency line 1: replay the stored result verbatim. ----
+   184→    existing = db.transactions().find_one({"idempotencyKey": idempotency_key})
+   185→    if existing is not None:
+   186→        return _response_for(existing)
+   187→
+   188→    # ---- Create the order via the MCP server (atomic stock lock). ----
+   189→    try:
+   190→        order = mcp_client.create_order(cleaned_items, agent_id, idempotency_key)
+   191→    except mcp_client.McpRemoteError as err:
+   192→        if err.code == -32001:  # INSUFFICIENT_STOCK — deterministic, store the failure
+   193→            sku = (err.data or {}).get("sku") if isinstance(err.data, dict) else None
+   194→            return _record_failed_transaction(
+   195→                agent_id, session_id, idempotency_key, None, 0, cleaned_items,
+   196→                f"INSUFFICIENT_STOCK{'/' + sku if sku else ''}", source,
+   197→            )
+   198→        # Other remote errors (rate limit, unauthorized) are NOT stored — retrying
+   199→        # the same key should be possible once the condition clears.
+   200→        raise TransactionError("MCP_" + err.message, str(err), 502, err.data)
+   201→    except mcp_client.McpUnavailable as err:
+   202→        # Transient transport failure — deliberately not persisted so a retry
+   203→        # with the same idempotency key re-attempts instead of replaying failure.
+   204→        raise TransactionError("MCP_UNAVAILABLE", str(err), 503)
+   205→
+   206→    order_number = order.get("orderNumber", "")
+   207→    amount_paise = int(order.get("totalPaise", 0))
+   208→    order_doc = _get_order_doc(order_number)
+   209→    order_oid = order_doc.get("_id") if order_doc else None
+   210→
+   211→    log_step(
+   212→        session_id, agent_id, "INVENTORY_LOCK",
+   213→        {
+   214→            "orderNumber": order_number,
+   215→            "items": order.get("items", []),
+   216→            "totalPaise": amount_paise,
+   217→            "duplicateOrder": bool(order.get("duplicate")),
+   218→            "source": source,
+   219→        },
+   220→        order_id=order_oid,
+   221→    )
+   222→
+   223→    # ---- Guardrail path selection (UX only; enforcement lives in wallet_service). ----
+   224→    if amount_paise > config.SPEND_LIMIT_PAISE:
+   225→        return _create_otp_gated_transaction(
+   226→            agent_id, session_id, idempotency_key, order_number, order_oid,
+   227→            amount_paise, source,
+   228→        )
+   229→
+   230→    return _execute_payment(
+   231→        agent_id, session_id, idempotency_key, order_number, order_oid,
+   232→        amount_paise, tx_type="autonomous", authorization=None, source=source,
+   233→        pre_authorized=False,
+   234→    )
+   235→
+   236→
+   237→# ---------------------------------------------------------------------------
+   238→# OTP-gated branch: amount above the limit — wallet untouched until verified
+   239→# ---------------------------------------------------------------------------
+   240→
+   241→def _create_otp_gated_transaction(
+   242→    agent_id: str,
+   243→    session_id: str,
+   244→    idempotency_key: str,
+   245→    order_number: str,
+   246→    order_oid: ObjectId | None,
+   247→    amount_paise: int,
+   248→    source: str,
+   249→) -> dict:
+   250→    tx_id = ObjectId()
+   251→    wallet = wallet_service.get_wallet(agent_id)
+   252→    version_before = wallet.get("version", 0) if wallet else 0
+   253→
+   254→    challenge = otp_service.create_challenge(tx_id)
+   255→
+   256→    now = _utcnow()
+   257→    doc = {
+   258→        "_id": tx_id,
+   259→        "idempotencyKey": idempotency_key,
+   260→        "agentId": agent_id,
+   261→        "orderId": order_oid,
+   262→        "amountPaise": amount_paise,
+   263→        "type": "otp_gated",
+   264→        "status": "awaiting_otp",
+   265→        "walletVersionBeforeTx": version_before,
+   266→        "razorpayOrderId": None,
+   267→        "razorpayPaymentId": None,
+   268→        "failureReason": None,
+   269→        "createdAt": now,
+   270→        "updatedAt": now,
+   271→        # Auto-clears stuck awaiting_otp locks (partial TTL index) — the janitor
+   272→        # ALSO marks them expired + cancels the order first, so records survive.
+   273→        "expiresAt": now + timedelta(seconds=config.OTP_TTL_SECONDS + 60),
+   274→    }
+   275→
+   276→    try:
+   277→        db.transactions().insert_one(doc)
+   278→    except Exception as err:  # noqa: BLE001
+   279→        if _is_duplicate_key(err):
+   280→            # Idempotency line 2: concurrent same-key execution raced past the
+   281→            # pre-check; the winner's stored snapshot is returned verbatim.
+   282→            winner = db.transactions().find_one({"idempotencyKey": idempotency_key})
+   283→            if winner is not None:
+   284→                return _response_for(winner)
+   285→        raise
+   286→
+   287→    response = {
+   288→        "status": "awaiting_otp",
+   289→        "transactionId": str(tx_id),
+   290→        "idempotencyKey": idempotency_key,
+   291→        "amountPaise": amount_paise,
+   292→        "orderNumber": order_number,
+   293→        "sessionId": session_id,
+   294→        "limitPaise": config.SPEND_LIMIT_PAISE,
+   295→    }
+   296→    if config.DEV_MODE:
+   297→        # DEV ONLY: in production this is sent via SMS/push, never returned in
+   298→        # the API response. otp_service stores ONLY the bcrypt hash.
+   299→        response["devOtp"] = challenge["otp"]
+   300→
+   301→    db.transactions().update_one(
+   302→        {"_id": tx_id},
+   303→        {"$set": {"resultSnapshot": dict(response), "otpChallengeId": None, "updatedAt": _utcnow()}},
+   304→    )
+   305→
+   306→    log_step(
+   307→        session_id, agent_id, "GUARDRAIL_OTP_REQUIRED",
+   308→        {
+   309→            "amountPaise": amount_paise,
+   310→            "limitPaise": config.SPEND_LIMIT_PAISE,
+   311→            "orderNumber": order_number,
+   312→            "transactionId": str(tx_id),
+   313→            "source": source,
+   314→            "message": "Amount exceeds delegated limit — human OTP verification required before any wallet debit.",
+   315→        },
+   316→        order_id=order_oid,
+   317→    )
+   318→    # Prompt the human gate in the UI (OTPModal.tsx listens for this).
+   319→    otp_payload = {
+   320→        "sessionId": session_id,
+   321→        "transactionId": str(tx_id),
+   322→        "amountPaise": amount_paise,
+   323→        "orderNumber": order_number,
+   324→    }
+   325→    if config.DEV_MODE:
+   326→        otp_payload["devOtp"] = challenge["otp"]
+   327→    ws_client.emit_to_room(session_id, "otp:required", otp_payload)
+   328→
+   329→    return dict(response)
+   330→
+   331→
+   332→# ---------------------------------------------------------------------------
+   333→# The ACID payment block — used by BOTH the autonomous path and the
+   334→# post-OTP-verified path. This is the only place that debits wallets.
+   335→# ---------------------------------------------------------------------------
+   336→
+   337→def _execute_payment(
+   338→    agent_id: str,
+   339→    session_id: str,
+   340→    idempotency_key: str,
+   341→    order_number: str,
+   342→    order_oid: ObjectId | None,
+   343→    amount_paise: int,
+   344→    tx_type: str,
+   345→    authorization: OtpAuthorization | None,
+   346→    source: str,
+   347→    pre_authorized: bool,
+   348→    existing_tx: dict | None = None,
+   349→) -> dict:
+   350→    tx_id = existing_tx["_id"] if existing_tx else ObjectId()
+   351→
+   352→    # Pre-flight wallet sanity (deterministic failures -> recorded, not silent).
+   353→    wallet = wallet_service.get_wallet(agent_id)
+   354→    if wallet is None:
+   355→        return _record_failed_transaction(
+   356→            agent_id, session_id, idempotency_key, order_oid, amount_paise, [],
+   357→            "WALLET_NOT_FOUND", source, tx_id=tx_id, order_number=order_number,
+   358→        )
+   359→    if wallet.get("status") != "active":
+   360→        return _record_failed_transaction(
+   361→            agent_id, session_id, idempotency_key, order_oid, amount_paise, [],
+   362→            "WALLET_FROZEN", source, tx_id=tx_id, order_number=order_number,
+   363→        )
+   364→    if wallet.get("balancePaise", 0) < amount_paise:
+   365→        return _record_failed_transaction(
+   366→            agent_id, session_id, idempotency_key, order_oid, amount_paise, [],
+   367→            "INSUFFICIENT_FUNDS", source, tx_id=tx_id, order_number=order_number,
+   368→        )
+   369→
+   370→    version_before = wallet.get("version", 0)
+   371→
+   372→    if not pre_authorized:
+   373→        log_step(
+   374→            session_id, agent_id, "GUARDRAIL_PASS",
+   375→            {
+   376→                "amountPaise": amount_paise,
+   377→                "limitPaise": config.SPEND_LIMIT_PAISE,
+   378→                "walletVersionBefore": version_before,
+   379→                "type": tx_type,
+   380→                "source": source,
+   381→            },
+   382→            order_id=order_oid,
+   383→        )
+   384→
+   385→    # ---- Multi-document ACID transaction -----------------------------------
+   386→    # debit + transaction-doc insert + Razorpay TEST order creation commit or
+   387→    # roll back TOGETHER: a Razorpay failure after the debit cannot leave the
+   388→    # wallet decremented with no corresponding record.
+   389→    # PRODUCTION NOTE: calling an external API inside the txn snapshot window is
+   390→    # acceptable here ONLY because this is TEST mode with no queue infra. The
+   391→    # production seam is a transactional outbox + worker (see razorpay_client.py).
+   392→    client = db.get_client()
+   393→    last_error: Exception | None = None
+   394→
+   395→    for attempt in range(1, 4):  # whole-txn retries on OCC exhaustion / transient races
+   396→        try:
+   397→            with client.start_session() as s:
+   398→                def _txn_callback(s):
+   399→                    # Guardrail is re-derived FRESH inside every attempt by
+   400→                    # wallet_service.execute_debit (no cached decision, no
+   401→                    # caller-supplied flag).
+   402→                    wallet_after = wallet_service.execute_debit(
+   403→                        agent_id, amount_paise, session=s, authorization=authorization
+   404→                    )
+   405→
+   406→                    now = _utcnow()
+   407→                    tx_doc = existing_tx or {
+   408→                        "_id": tx_id,
+   409→                        "idempotencyKey": idempotency_key,
+   410→                        "agentId": agent_id,
+   411→                        "orderId": order_oid,
+   412→                        "amountPaise": amount_paise,
+   413→                        "type": tx_type,
+   414→                        "status": "pending",
+   415→                        "walletVersionBeforeTx": version_before,
+   416→                        "razorpayOrderId": None,
+   417→                        "razorpayPaymentId": None,
+   418→                        "failureReason": None,
+   419→                        "createdAt": now,
+   420→                        "updatedAt": now,
+   421→                        # Generous pending TTL (stuck-lock backstop; the janitor
+   422→                        # expires orders/records before this ever fires).
+   423→                        "expiresAt": now + timedelta(seconds=config.RECOVERY_SESSION_TTL_SECONDS + 60),
+   424→                    }
+   425→                    if not existing_tx:
+   426→                        # Idempotency line 2 (inside txn): unique index races resolve
+   427→                        # to the winner's snapshot.
+   428→                        try:
+   429→                            db.transactions().insert_one(tx_doc, session=s)
+   430→                        except Exception as err:  # noqa: BLE001
+   431→                            if _is_duplicate_key(err):
+   432→                                winner = db.transactions().find_one(
+   433→                                    {"idempotencyKey": idempotency_key}, session=s
+   434→                                )
+   435→                                if winner is not None:
+   436→                                    return ("duplicate", winner, None)
+   437→                            raise
+   438→                    else:
+   439→                        db.transactions().update_one(
+   440→                            {"_id": tx_id, "status": {"$in": ["awaiting_otp", "otp_verified"]}},
+   441→                            {"$set": {"status": "pending", "updatedAt": now}},
+   442→                            session=s,
+   443→                        )
+   444→
+   445→                    # Razorpay TEST order (REAL API call — failures abort the txn
+   446→                    # and roll the debit back).
+   447→                    rzp_order = razorpay_client.create_test_order(
+   448→                        amount_paise,
+   449→                        receipt=order_number,
+   450→                        notes={
+   451→                            "orderNumber": order_number,
+   452→                            "agentId": agent_id,
+   453→                            "sessionId": session_id,
+   454→                            "type": tx_type,
+   455→                        },
+   456→                    )
+   457→                    rzp_order_id = rzp_order.get("id", "")
+   458→
+   459→                    db.transactions().update_one(
+   460→                        {"_id": tx_id},
+   461→                        {"$set": {"razorpayOrderId": rzp_order_id, "updatedAt": _utcnow()}},
+   462→                        session=s,
+   463→                    )
+   464→                    db.orders().update_one(
+   465→                        {"orderNumber": order_number},
+   466→                        {
+   467→                            "$set": {
+   468→                                "razorpayOrderId": rzp_order_id,
+   469→                                "status": "payment_pending",
+   470→                                "updatedAt": _utcnow(),
+   471→                            }
+   472→                        },
+   473→                        session=s,
+   474→                    )
+   475→                    return ("ok", wallet_after, rzp_order_id)
+   476→
+   477→                outcome = s.with_transaction(_txn_callback)
+   478→                kind, wallet_after, rzp_order_id = outcome[0], outcome[1], outcome[2]
+   479→
+   480→                if kind == "duplicate":
+   481→                    return _response_for(wallet_after)  # winner's snapshot, verbatim
+   482→
+   483→            response = {
+   484→                "status": "pending",  # awaiting Razorpay payment.captured webhook
+   485→                "transactionId": str(tx_id),
+   486→                "idempotencyKey": idempotency_key,
+   487→                "amountPaise": amount_paise,
+   488→                "orderNumber": order_number,
+   489→                "razorpayOrderId": rzp_order_id,
+   490→                "walletBalancePaise": wallet_after.get("balancePaise"),
+   491→                "message": "Payment initiated — order awaiting Razorpay confirmation.",
+   492→            }
+   493→            db.transactions().update_one(
+   494→                {"_id": tx_id},
+   495→                {"$set": {"resultSnapshot": response, "updatedAt": _utcnow()}},
+   496→            )
+   497→
+   498→            log_step(
+   499→                session_id, agent_id, "ORDER_GENERATED",
+   500→                {
+   501→                    "orderNumber": order_number,
+   502→                    "razorpayOrderId": rzp_order_id,
+   503→                    "amountPaise": amount_paise,
+   504→                    "walletBalancePaise": wallet_after.get("balancePaise"),
+   505→                    "type": tx_type,
+   506→                    "source": source,
+   507→                },
+   508→                order_id=order_oid,
+   509→            )
+   510→            return dict(response)
+   511→
+   512→        except razorpay_client.RazorpayNotConfigured as err:
+   513→            # Txn aborted: wallet debit already rolled back with the insert.
+   514→            return _record_failed_transaction(
+   515→                agent_id, session_id, idempotency_key, order_oid, amount_paise, [],
+   516→                "RAZORPAY_NOT_CONFIGURED", source, tx_id=tx_id, order_number=order_number,
+   517→                cancel_order=True,
+   518→            )
+   519→        except razorpay_client.RazorpayCallFailed as err:
+   520→            return _record_failed_transaction(
+   521→                agent_id, session_id, idempotency_key, order_oid, amount_paise, [],
+   522→                f"RAZORPAY_ORDER_FAILED: {err}", source, tx_id=tx_id,
+   523→                order_number=order_number, cancel_order=True,
+   524→            )
+   525→        except wallet_service.GuardrailViolation as err:
+   526→            # Someone attempted a >limit debit without verified OTP authorization
+   527→            # (defense-in-depth; execute_transaction routes those to the OTP path
+   528→            # first). Fail CLOSED, record the attempt.
+   529→            return _record_failed_transaction(
+   530→                agent_id, session_id, idempotency_key, order_oid, amount_paise, [],
+   531→                f"GUARDRAIL_VIOLATION: {err.code}", source, tx_id=tx_id,
+   532→                order_number=order_number, cancel_order=True,
+   533→            )
+   534→        except wallet_service.ConcurrentModificationMaxRetries as err:
+   535→            # Subclass of WalletError — MUST precede the generic WalletError
+   536→            # handler so the retry branch is actually reachable.
+   537→            last_error = err
+   538→            continue  # retry the whole ACID txn with a fresh snapshot
+   539→        except wallet_service.WalletError as err:
+   540→            return _record_failed_transaction(
+   541→                agent_id, session_id, idempotency_key, order_oid, amount_paise, [],
+   542→                err.code, source, tx_id=tx_id, order_number=order_number,
+   543→                cancel_order=True,
+   544→            )
+   545→
+   546→    return _record_failed_transaction(
+   547→        agent_id, session_id, idempotency_key, order_oid, amount_paise, [],
+   548→        f"CONCURRENT_MODIFICATION_MAX_RETRIES: {last_error}", source,
+   549→        tx_id=tx_id, order_number=order_number, cancel_order=True,
+   550→    )
+   551→
+   552→
+   553→def _is_duplicate_key(err: Exception) -> bool:
+   554→    code = getattr(err, "code", None)
+   555→    if code == 11000:
+   556→        return True
+   557→    msg = str(err)
+   558→    return "E11000" in msg or "duplicate key" in msg.lower()
+   559→
+   560→
+   561→def _record_failed_transaction(
+   562→    agent_id: str,
+   563→    session_id: str,
+   564→    idempotency_key: str,
+   565→    order_oid: ObjectId | None,
+   566→    amount_paise: int,
+   567→    items: list,
+   568→    reason: str,
+   569→    source: str,
+   570→    tx_id: ObjectId | None = None,
+   571→    order_number: str | None = None,
+   572→    cancel_order: bool = False,
+   573→) -> dict:
+   574→    """Record a deterministic failure so idempotent replays return it verbatim."""
+   575→    tx_id = tx_id or ObjectId()
+   576→    now = _utcnow()
+   577→    response = {
+   578→        "status": "failed",
+   579→        "transactionId": str(tx_id),
+   580→        "idempotencyKey": idempotency_key,
+   581→        "amountPaise": amount_paise,
+   582→        "orderNumber": order_number,
+   583→        "failureReason": reason,
+   584→    }
+   585→    try:
+   586→        db.transactions().update_one(
+   587→            {"_id": tx_id},
+   588→            {
+   589→                "$set": {
+   590→                    "idempotencyKey": idempotency_key,
+   591→                    "agentId": agent_id,
+   592→                    "orderId": order_oid,
+   593→                    "amountPaise": amount_paise,
+   594→                    "type": "autonomous",
+   595→                    "status": "failed",
+   596→                    "walletVersionBeforeTx": (wallet_service.get_wallet(agent_id) or {}).get("version", 0),
+   597→                    "razorpayOrderId": None,
+   598→                    "razorpayPaymentId": None,
+   599→                    "failureReason": reason,
+   600→                    "createdAt": now,
+   601→                    "updatedAt": now,
+   602→                    "resultSnapshot": response,
+   603→                }
+   604→            },
+   605→            upsert=True,
+   606→        )
+   607→    except Exception as err:  # noqa: BLE001
+   608→        if not _is_duplicate_key(err):
+   609→            raise
+   610→
+   611→    if cancel_order and order_number:
+   612→        cancel_order_and_release_stock(order_number, reason, agent_id, session_id)
+   613→
+   614→    log_step(
+   615→        session_id, agent_id, "ORDER_CANCELLED",
+   616→        {"orderNumber": order_number, "reason": reason, "source": source},
+   617→        order_id=order_oid,
+   618→    )
+   619→    return dict(response)
+   620→
+   621→
+   622→# ---------------------------------------------------------------------------
+   623→# OTP verification — the human approval gate
+   624→# ---------------------------------------------------------------------------
+   625→
+   626→def verify_otp(transaction_id: str, otp: str, session_id_hint: str = "") -> tuple[dict, int]:
+   627→    """Verify the human-entered OTP and, on success, execute the OTP-gated payment.
+   628→
+   629→    Returns (response, http_status).
+   630→    """
+   631→    try:
+   632→        tx_oid = ObjectId(transaction_id)
+   633→    except (InvalidId, TypeError):
+   634→        raise TransactionError("INVALID_TRANSACTION_ID", "transactionId must be a Mongo ObjectId hex.")
+   635→
+   636→    tx = db.transactions().find_one({"_id": tx_oid})
+   637→    if tx is None:
+   638→        raise TransactionError("TRANSACTION_NOT_FOUND", f"No transaction {transaction_id}.", 404)
+   639→
+   640→    if tx.get("status") != "awaiting_otp":
+   641→        # Idempotent replay: already verified / completed / failed / rejected.
+   642→        return _response_for(tx), 200
+   643→
+   644→    agent_id = tx["agentId"]
+   645→    session_id = tx.get("resultSnapshot", {}).get("sessionId") or session_id_hint or f"tx-{transaction_id}"
+   646→    # Prefer the sessionId captured at creation for room targeting.
+   647→    order_doc = db.orders().find_one({"_id": tx.get("orderId")}) if tx.get("orderId") else None
+   648→    order_number = order_doc.get("orderNumber") if order_doc else None
+   649→
+   650→    outcome, challenge = otp_service.verify_and_claim(tx_oid, otp or "")
+   651→
+   652→    if outcome == "verified":
+   653→        log_step(
+   654→            session_id, agent_id, "OTP_VERIFIED",
+   655→            {"transactionId": str(tx_oid), "attempts": challenge.get("attempts"), "orderNumber": order_number},
+   656→            order_id=tx.get("orderId"),
+   657→        )
+   658→        db.transactions().update_one(
+   659→            {"_id": tx_oid, "status": "awaiting_otp"},
+   660→            {"$set": {"status": "otp_verified", "updatedAt": _utcnow()}},
+   661→        )
+   662→        tx["status"] = "otp_verified"
+   663→
+   664→        # Server-side proof — the ONLY way an above-limit debit can proceed.
+   665→        authorization = OtpAuthorization(agent_id, tx_oid, tx["amountPaise"])
+   666→        response = _execute_payment(
+   667→            agent_id, session_id, tx["idempotencyKey"], order_number or "",
+   668→            tx.get("orderId"), tx["amountPaise"], tx_type="otp_gated",
+   669→            authorization=authorization, source="otp_verify",
+   670→            pre_authorized=True, existing_tx=tx,
+   671→        )
+   672→        return response, 200
+   673→
+   674→    if outcome == "already_verified":
+   675→        return _response_for(tx), 200
+   676→
+   677→    if outcome == "max_attempts":
+   678→        db.transactions().update_one(
+   679→            {"_id": tx_oid, "status": "awaiting_otp"},
+   680→            {"$set": {"status": "rejected", "failureReason": "OTP_MAX_ATTEMPTS", "updatedAt": _utcnow()}},
+   681→        )
+   682→        db.transactions().update_one({"_id": tx_oid}, {"$unset": {"expiresAt": ""}})
+   683→        if order_number:
+   684→            cancel_order_and_release_stock(order_number, "OTP_MAX_ATTEMPTS", agent_id, session_id)
+   685→        else:
+   686→            log_step(session_id, agent_id, "ORDER_CANCELLED",
+   687→                     {"transactionId": str(tx_oid), "reason": "OTP_MAX_ATTEMPTS"})
+   688→        return (
+   689→            {"status": "rejected", "transactionId": str(tx_oid),
+   690→             "message": "3 failed OTP attempts — transaction rejected and stock released."},
+   691→            401,
+   692→        )
+   693→
+   694→    if outcome == "expired":
+   695→        db.transactions().update_one(
+   696→            {"_id": tx_oid, "status": "awaiting_otp"},
+   697→            {"$set": {"status": "expired", "failureReason": "OTP_EXPIRED", "updatedAt": _utcnow()},
+   698→             "$unset": {"expiresAt": ""}},
+   699→        )
+   700→        if order_number:
+   701→            cancel_order_and_release_stock(order_number, "OTP_EXPIRED", agent_id, session_id)
+   702→        return (
+   703→            {"status": "expired", "transactionId": str(tx_oid), "message": "OTP challenge expired (5-minute TTL)."},
+   704→            410,
+   705→        )
+   706→
+   707→    # outcome == 'wrong'
+   708→    left = otp_service.attempts_left(tx_oid)
+   709→    return (
+   710→        {"status": "awaiting_otp", "transactionId": str(tx_oid),
+   711→         "attemptsLeft": left, "message": "Incorrect OTP."},
+   712→        401,
+   713→    )
+   714→
+   715→
+   716→# ---------------------------------------------------------------------------
+   717→# Janitor — expires stuck awaiting_otp / pending transactions BEFORE the TTL
+   718→# index deletes them, cancelling the order and releasing reserved stock.
+   719→# ---------------------------------------------------------------------------
+   720→
+   721→def expire_stale_transactions(limit: int = 100) -> int:
+   722→    now = _utcnow()
+   723→    stale = db.transactions().find(
+   724→        {"status": {"$in": ["pending", "awaiting_otp"]}, "expiresAt": {"$lt": now}},
+   725→        {"_id": 1, "agentId": 1, "orderId": 1, "idempotencyKey": 1, "status": 1},
+   726→    ).limit(limit)
+   727→    expired = 0
+   728→    for tx in stale:
+   729→        order_doc = db.orders().find_one({"_id": tx.get("orderId")}) if tx.get("orderId") else None
+   730→        # PRODUCTION NOTE: expiring a debit-ed 'pending' transaction would also
+   731→        # trigger a wallet credit (refund) here; out of scope for the TEST-mode build.
+   732→        db.transactions().update_one(
+   733→            {"_id": tx["_id"], "status": {"$in": ["pending", "awaiting_otp"]}},
+   734→            {"$set": {"status": "expired", "failureReason": "TTL_EXPIRED", "updatedAt": now},
+   735→             "$unset": {"expiresAt": ""}},
+   736→        )
+   737→        if order_doc and order_doc.get("orderNumber"):
+   738→            cancel_order_and_release_stock(
+   739→                order_doc["orderNumber"], "TTL_EXPIRED", tx["agentId"], f"tx-{tx['_id']}"
+   740→            )
+   741→        expired += 1
+   742→    return expired
+   743→
+   744→
+   745→def list_transactions(agent_id: str, limit: int = 20) -> list[dict]:
+   746→    cursor = (
+   747→        db.transactions()
+   748→        .find({"agentId": agent_id})
+   749→        .sort([("createdAt", -1)])
+   750→        .limit(limit)
+   751→    )
+   752→    out = []
+   753→    for doc in cursor:
+   754→        out.append(
+   755→            {
+   756→                "transactionId": str(doc["_id"]),
+   757→                "idempotencyKey": doc.get("idempotencyKey"),
+   758→                "agentId": doc.get("agentId"),
+   759→                "amountPaise": doc.get("amountPaise"),
+   760→                "type": doc.get("type"),
+   761→                "status": doc.get("status"),
+   762→                "razorpayOrderId": doc.get("razorpayOrderId"),
+   763→                "failureReason": doc.get("failureReason"),
+   764→                "createdAt": doc.get("createdAt").isoformat() if doc.get("createdAt") else None,
+   765→                "updatedAt": doc.get("updatedAt").isoformat() if doc.get("updatedAt") else None,
+   766→            }
+   767→        )
+   768→    return out
+   769→
+   770→
+   771→def generate_idempotency_key() -> str:
+   772→    """Helper for programmatic callers (e.g. Onyx's checkout_and_pay tool)."""
+   773→    return str(uuid.uuid4())
+   774→
+   775→

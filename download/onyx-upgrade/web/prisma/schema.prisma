@@ -1,0 +1,107 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Agent-readable catalog ----------
+model Product {
+  id             String     @id @default(cuid())
+  sku            String     @unique
+  name           String
+  category       String // watches | apparel | audio | accessories
+  description    String
+  pricePaise     Int
+  marginPct      Int // merchant margin — powers recommendation ranking
+  stock          Int
+  rating         Float
+  tags           String // comma separated, agent-searchable
+  compatibleWith String // comma separated SKUs — powers upsell engine
+  active         Boolean    @default(true)
+  createdAt      DateTime   @default(now())
+  orderItems     OrderItem[]
+}
+
+// ---------- Buyer delegated wallet ----------
+model Wallet {
+  id                 String   @id @default(cuid())
+  label              String   @default("Primary delegated wallet")
+  currency           String   @default("INR")
+  balancePaise       Int      @default(1800000)
+  monthlyBudgetPaise Int      @default(2500000)
+  spentThisMonthPaise Int      @default(485000)
+  trustScore         Int      @default(60) // 0-100, adaptive
+  baseLimitPaise     Int      @default(500000)
+  updatedAt          DateTime @updatedAt
+}
+
+// ---------- Orders ----------
+model Order {
+  id           String       @id @default(cuid())
+  shortId      String       @unique // RZM-000001
+  status       String // AWAITING_OTP | PAID | DECLINED
+  declineCode  String? // VELOCITY | BUDGET | INSUFFICIENT_FUNDS | OTP_EXPIRED
+  subtotalPaise Int
+  discountPaise Int        @default(0)
+  totalPaise   Int
+  campaignId   String?
+  decision     String // JSON snapshot of the policy evaluation
+  paymentRef   String? // rzp_test_...
+  createdAt    DateTime     @default(now())
+  items        OrderItem[]
+  otp          OtpChallenge?
+}
+
+model OrderItem {
+  id          String   @id @default(cuid())
+  orderId     String
+  order       Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id])
+  qty         Int      @default(1)
+  unitPaise   Int
+  role        String   @default("primary") // primary | upsell
+}
+
+// ---------- OTP challenges ----------
+model OtpChallenge {
+  id        String   @id @default(cuid())
+  orderId   String   @unique
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  code      String
+  status    String   @default("PENDING") // PENDING | VERIFIED | EXPIRED
+  attempts  Int      @default(0)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+}
+
+// ---------- Merchant growth campaigns ----------
+model Campaign {
+  id              String   @id @default(cuid())
+  name            String
+  type            String // FLAT_PERCENT | BUNDLE_DISCOUNT | FREE_SHIPPING
+  scope           String // category: watches | sku: ACC-WATCH-001 | all
+  value           Int // percent off / bundle pct
+  status          String   @default("ACTIVE") // ACTIVE | PAUSED | ENDED
+  budgetCapPaise  Int      @default(1000000)
+  impressions     Int      @default(0)
+  conversions     Int      @default(0)
+  incrementalPaise Int    @default(0)
+  createdAt       DateTime @default(now())
+}
+
+// ---------- Money-action audit trail ----------
+model AuditEvent {
+  id          String   @id @default(cuid())
+  type        String // SEARCH | POLICY | CHECKOUT | OTP_SENT | OTP_VERIFIED | OTP_FAILED
+  // PAYMENT_CAPTURED | DECLINED | UPSELL_OFFERED | UPSELL_ACCEPTED | UPSELL_DECLINED | CAMPAIGN_APPLIED
+  orderId     String?
+  amountPaise Int?
+  decision    String? // AUTO_APPROVED | OTP_REQUIRED | DECLINED | ...
+  summary     String
+  payload     String // JSON detail, explainability
+  createdAt   DateTime @default(now())
+}

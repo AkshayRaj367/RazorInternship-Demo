@@ -1,0 +1,29 @@
+{
+  "name": "razor-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Razor-MCP: autonomous agentic commerce gateway — MCP catalog, guardrailed wallet engine, OTP gate, active revenue recovery, RazorSense audit trail. Razorpay TEST MODE only.",
+  "workspaces": [
+    "packages/*",
+    "apps/mcp-server",
+    "apps/ws-gateway",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:mcp": "npm run dev -w apps/mcp-server",
+    "dev:ws": "npm run dev -w apps/ws-gateway",
+    "dev:web": "npm run dev -w apps/web",
+    "build": "npm run build -w packages/shared-types && npm run build -w apps/mcp-server && npm run build -w apps/ws-gateway && npm run build -w apps/web",
+    "seed:catalog": "npm run seed -w apps/mcp-server",
+    "seed:wallets": "python3 apps/agent-service/scripts/seed_wallets.py",
+    "typecheck": "tsc --noEmit -p packages/shared-types && tsc --noEmit -p apps/mcp-server && tsc --noEmit -p apps/ws-gateway && tsc --noEmit -p apps/web"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.4"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

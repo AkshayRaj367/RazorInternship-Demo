@@ -1,0 +1,22 @@
+# Node
+node_modules/
+dist/
+.next/
+out/
+build/
+*.tsbuildinfo
+next-env.d.ts
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Secrets & env (copy from .env.example)
+.env
+.env.local
+.env*.local
+
+# Logs / misc
+*.log
+.DS_Store
